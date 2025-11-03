@@ -215,7 +215,10 @@ async function payInvoice(accepts, payer, conn) {
   const { status, json } = await httpPost(`${BASE_URL}/connect?duration_min=${accepts.extra?.minutes || 5}&network=sol`, {
     headers: { 'X-PAYMENT': XPAYMENT }
   });
-  if (status !== 200) throw new Error(`Payment failed: ${JSON.stringify(json)}`);
+  if (status !== 200) {
+    const errorMsg = typeof json === 'string' ? json : JSON.stringify(json);
+    throw new Error(`Payment failed (${status}): ${errorMsg}`);
+  }
   return json; // { access_token, expires_at, payment... }
 }
 
@@ -272,7 +275,10 @@ async function extendSession(accepts, token, payer, conn) {
   const { status, json } = await httpPost(`${BASE_URL}/extend?duration_min=${accepts.extra?.minutes || 5}&network=sol`, {
     headers: { 'X-SESSION': token, 'X-PAYMENT': XPAYMENT }
   });
-  if (status !== 200) throw new Error(`Extend failed: ${JSON.stringify(json)}`);
+  if (status !== 200) {
+    const errorMsg = typeof json === 'string' ? json : JSON.stringify(json);
+    throw new Error(`Extend failed (${status}): ${errorMsg}`);
+  }
   return json; // { access_token, expires_at, ... }
 }
 
@@ -414,11 +420,24 @@ async function sendToDiscord(webhookUrl, message) {
   const payer = loadKeypair();
 
   // 1) Get invoice & pay for initial session
-  const invoice = await getInvoice(5);
-  console.log('🧾 Invoice (sol):', invoice);
+  let start;
+  try {
+    const invoice = await getInvoice(5);
+    console.log('🧾 Invoice (sol):', invoice);
 
-  const start = await payInvoice(invoice, payer, conn);
-  console.log('✅ Paid, token:', start.access_token, 'expires_at:', start.expires_at);
+    start = await payInvoice(invoice, payer, conn);
+    console.log('✅ Paid, token:', start.access_token, 'expires_at:', start.expires_at);
+  } catch (e) {
+    console.error('\n❌ Failed to create session:', e.message || e);
+    if (e.message?.includes('Payment failed')) {
+      console.error('\n   Possible causes:');
+      console.error('   - Insufficient USDC balance');
+      console.error('   - Network/RPC issues');
+      console.error('   - Facilitator service unavailable');
+      console.error('\n   Try again in a few moments.');
+    }
+    process.exit(1);
+  }
 
   // 2) Connect websocket
   const wsUrl = BASE_URL.replace(/^http/, 'ws') + `/stream?token=${encodeURIComponent(start.access_token)}`;
@@ -428,8 +447,15 @@ async function sendToDiscord(webhookUrl, message) {
   const ws = new WebSocket(wsUrl);
 
   ws.on('open', () => console.log('WS open'));
-  ws.on('close', () => console.log('WS closed'));
-  ws.on('error', err => console.error('WS error', err));
+  ws.on('close', (code, reason) => {
+    console.log(`WS closed (code: ${code})`);
+    if (reason) console.log(`   Reason: ${reason.toString()}`);
+    console.log('   To reconnect, run the script again.');
+  });
+  ws.on('error', err => {
+    console.error('⚠️  WS error:', err.message || err);
+    console.error('   Connection may have been lost. Check network and try again.');
+  });
 
   ws.on('message', async (data) => {
     const text = data.toString();
@@ -438,14 +464,43 @@ async function sendToDiscord(webhookUrl, message) {
       if (msg.type === 'expiry_soon') {
         console.log('⏳ expiry_soon:', msg.seconds_remaining, 's — extending…');
 
-        try {
-          // 3) Request extend invoice, pay, and swap token
-          const extInvoice = await getExtendInvoice(5, currentToken);
-          const extPaid = await extendSession(extInvoice, currentToken, payer, conn);
-          currentToken = extPaid.access_token;
-          console.log('🔁 Extended. New expiry:', extPaid.expires_at);
-        } catch (e) {
-          console.error('Extend failed:', e);
+        // Retry extension with exponential backoff
+        let retries = 3;
+        let retryDelay = 1000; // Start with 1 second
+        let extended = false;
+
+        for (let attempt = 1; attempt <= retries; attempt++) {
+          try {
+            // 3) Request extend invoice, pay, and swap token
+            const extInvoice = await getExtendInvoice(5, currentToken);
+            const extPaid = await extendSession(extInvoice, currentToken, payer, conn);
+            currentToken = extPaid.access_token;
+            console.log('🔁 Extended. New expiry:', extPaid.expires_at);
+            extended = true;
+            break; // Success - exit retry loop
+          } catch (e) {
+            const isLastAttempt = attempt === retries;
+            const isFacilitatorError = e.message?.includes('Facilitator') || e.message?.includes('521') || e.message?.includes('verify failed');
+            
+            if (isLastAttempt) {
+              console.error(`⚠️  Extend failed after ${retries} attempts:`, e.message || e);
+              console.error('   Session will expire. To continue, reconnect manually.');
+            } else {
+              console.warn(`⚠️  Extend attempt ${attempt}/${retries} failed:`, e.message || e);
+              if (isFacilitatorError) {
+                console.warn(`   Facilitator issue detected. Retrying in ${retryDelay / 1000}s...`);
+              } else {
+                console.warn(`   Retrying in ${retryDelay / 1000}s...`);
+              }
+              // Exponential backoff: 1s, 2s, 4s
+              await new Promise(resolve => setTimeout(resolve, retryDelay));
+              retryDelay *= 2;
+            }
+          }
+        }
+
+        if (!extended) {
+          console.error('   All retry attempts exhausted. Session extension failed.');
         }
       } else if (msg.type === 'session_extended') {
         console.log('ℹ️ server ack:', msg);
@@ -453,15 +508,30 @@ async function sendToDiscord(webhookUrl, message) {
         console.log('ℹ️ stream connected');
       } else {
         // News message - forward to Discord
-        await sendToDiscord(DISCORD_WEBHOOK_URL, msg);
+        try {
+          await sendToDiscord(DISCORD_WEBHOOK_URL, msg);
+        } catch (e) {
+          console.error('⚠️  Failed to forward message to Discord:', e.message || e);
+          // Continue processing - don't crash on Discord failures
+        }
       }
-    } catch {
+    } catch (parseError) {
       // non-JSON relays - might be raw news messages
       try {
         const parsed = JSON.parse(text);
-        await sendToDiscord(DISCORD_WEBHOOK_URL, parsed);
+        try {
+          await sendToDiscord(DISCORD_WEBHOOK_URL, parsed);
+        } catch (e) {
+          console.error('⚠️  Failed to forward message to Discord:', e.message || e);
+        }
       } catch {
-        console.log('📨 Raw (non-JSON):', text);
+        // Handle session expiry messages
+        if (text.includes('Session expired') || text.includes('Renew')) {
+          console.warn('⚠️  Session expired. WebSocket will close.');
+          console.warn('   Reconnect by running the script again.');
+        } else {
+          console.log('📨 Raw (non-JSON):', text);
+        }
       }
     }
   });
